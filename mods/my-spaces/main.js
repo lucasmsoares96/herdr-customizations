@@ -28,6 +28,8 @@ function place(s, ps) {
   return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
 const rowHeight = ({ tree }) => (tree ? 28 : 30);
+// Extra left padding for a worktree nested in another one (capped so names keep room).
+const indent = (depth) => Math.min(Math.max((depth ?? 1) - 1, 0), 4) * 16;
 const RAIL_CELL = 32;
 // A space's name and its git tail never shrink below this, so a short one ("api")
 // stays readable instead of turning into an ellipsis next to a long branch.
@@ -343,8 +345,20 @@ export default class Spaces extends View {
       const kids = list.filter((k) => nested(k) && k.g.repo === repo);
       const open = new Set(list.filter((k) => k.g?.repo === repo).map((k) => k.g.top));
       const closed = (this.trees[repo] ?? []).filter((c) => !c.main && !open.has(c.path));
-      const all = [...kids, ...closed.map((c) => ghost(c, machine, null))];
-      all.forEach((k, n) => out.push({ ...k, tree: n === all.length - 1 ? "└─" : "├─" }));
+      const entries = [...kids.map((k) => ({ row: k, path: k.g.top })), ...closed.map((c) => ({ row: ghost(c, machine, null), path: c.path }))];
+      // A worktree whose folder is inside another worktree's nests under the deepest one.
+      const paths = [...new Set(entries.map((e) => e.path))];
+      const parentOf = (path) => paths.filter((q) => q !== path && path.startsWith(q + "/")).sort((a, b) => b.length - a.length)[0] ?? null;
+      const walk = (parent, depth) => {
+        const here = entries.filter((e) => parentOf(e.path) === parent);
+        const folders = [...new Set(here.map((e) => e.path))];
+        folders.forEach((folder, n) => {
+          // Several spaces in one worktree stay together, its nested worktrees after them.
+          for (const e of here.filter((x) => x.path === folder)) out.push({ ...e.row, tree: n === folders.length - 1 ? "└─" : "├─", depth });
+          walk(folder, depth + 1);
+        });
+      };
+      walk(null, 1);
     };
     for (const r of list) {
       if (nested(r)) {
@@ -490,7 +504,7 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree }, t) {
+  row({ w, i, g, tree, depth }, t) {
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
     const colors = shared("space.colors") ?? {};
@@ -540,7 +554,7 @@ export default class Spaces extends View {
         h_flex()
           .gap(9)
           .items_center()
-          .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
+          .when(Boolean(tree), el => el.pl(22 + indent(depth)).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_initial().min_w(SIDE_MIN).truncate().text_color(t.foreground).child(w.name))
           .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
@@ -549,7 +563,7 @@ export default class Spaces extends View {
 
   // A checkout with no space: dimmed, and a click opens a space there (unnamed, so it
   // follows the checkout and nests like the shipped Open worktree does).
-  ghostRow({ ghost: c, w, tree, name }, t) {
+  ghostRow({ ghost: c, w, tree, name, depth }, t) {
     const label = name ?? c.branch ?? base(c.path);
     const where = c.path.startsWith(home()) ? `~${c.path.slice(home().length)}` : c.path;
     return h_flex()
@@ -565,7 +579,7 @@ export default class Spaces extends View {
       .tooltip(`Not open: ${where}\nClick to open a space here.`)
       .on_click(() => run("space.new", { folder: c.path, machine: w.machine ?? "" }))
       .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "git-menu", kind: "popup", width: 240, height: 300, props: { folder: c.path, on: w.machine ?? null } }); })
-      .when(Boolean(tree), el => el.pl(30).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
+      .when(Boolean(tree), el => el.pl(30 + indent(depth)).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
       .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).border_1().border_color(t.dim).items_center().justify_center().text_size(10.5).font_bold().text_color(t.dim).child([...label][0]?.toUpperCase() ?? "?")))
       .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(label))
       .when(!tree && Boolean(c.branch) && c.branch !== "main" && c.branch !== "master", el => el.child(div().flex_none().text_size(11.5).text_color(t.dim).child(c.branch)));

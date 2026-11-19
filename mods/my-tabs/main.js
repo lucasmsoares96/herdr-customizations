@@ -34,12 +34,15 @@ function label(tab, lead) {
 
 export default class Tabs extends View {
   init(_props, cx) {
+    try { this.zoomed = JSON.parse(localStorage.getItem("zoom.saved") ?? "null"); } catch { this.zoomed = null; }
+    if (this.zoomed) this.zoomed.seen = true;
     try { this.recent = JSON.parse(localStorage.getItem("agents.recent") ?? "[]"); } catch { this.recent = []; }
     if (!Array.isArray(this.recent)) this.recent = [];
     if (!checking()) cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        if (c === "agent-recent") this.step(1);
+        if (c === "zoom") this.zoom();
+        else if (c === "agent-recent") this.step(1);
         else if (c === "agent-recent-back") this.step(-1);
       }
     });
@@ -109,6 +112,54 @@ export default class Tabs extends View {
     return agents().filter((a) => a.pane && shown.has(a.pane));
   }
 
+  // Cmd+Shift+Enter toggles focus mode: the sidebar folds to its rail, the side panel
+  // hides and, in a split tab, the focused pane is zoomed. Pressing it again (or
+  // unzooming that pane any other way, or showing another tab) puts everything back.
+  // Whether it is on is this mod's own state, not the pane's zoom: a one-pane tab
+  // has nothing to zoom but still folds its sides.
+  zoom() {
+    if (this.zoomed) { this.unfold(true); return; }
+    const tab = spaces().find((s) => s.active)?.tabs?.find((x) => x.active);
+    if (!tab) return;
+    const root = layout(), sidebar = find(root, "sidebar"), panel = find(root, "panel");
+    const px = sidebar?.size?.px ?? 268;
+    const zoomPane = tab.panes > 1 && !tab.zoomed;
+    this.zoomed = { tab: tab.id, pane: zoomPane, seen: false, at: Date.now(),
+      sidebar: !sidebar?.hidden && px >= 160 ? px : null, panel: Boolean(panel && !panel.hidden) };
+    try { localStorage.setItem("zoom.saved", JSON.stringify(this.zoomed)); } catch {}
+    if (zoomPane) run("pane.zoom");
+    if (this.zoomed.sidebar !== null) {
+      setShared("sidebar.width", px);
+      setShared("sidebar.collapsed", true);
+      run("layout.resize", { id: "sidebar", px: window()?.platform === "macos" ? 76 : 44 });
+    }
+    if (this.zoomed.panel) run("layout.hide", { id: "panel" });
+  }
+
+  // Back from focus mode: asked for (force), another tab shown, or the pane it zoomed
+  // was unzoomed some other way.
+  unfold(force = false) {
+    const z = this.zoomed;
+    if (!z) return;
+    const tab = spaces().find((s) => s.active)?.tabs?.find((x) => x.active);
+    if (!force) {
+      if (tab?.id === z.tab) {
+        if (!z.pane) return; // nothing was zoomed: only the key ends it
+        if (tab.zoomed) { z.seen = true; return; }
+        // Until the zoom lands, an unzoomed tab is the moment before it.
+        if (!z.seen && Date.now() - z.at < 2000) return;
+      }
+    }
+    this.zoomed = null;
+    try { localStorage.removeItem("zoom.saved"); } catch {}
+    if (force && z.pane && tab?.id === z.tab && tab.zoomed) run("pane.zoom");
+    if (z.sidebar !== null && z.sidebar >= 160) {
+      setShared("sidebar.collapsed", false);
+      run("layout.resize", { id: "sidebar", px: z.sidebar });
+    }
+    if (z.panel) run("layout.show", { id: "panel" });
+  }
+
   // The focused agent goes on top of the history.
   track() {
     if (shared("agent-switcher.open")) return;
@@ -144,6 +195,7 @@ export default class Tabs extends View {
 
   render() {
     this.track();
+    this.unfold();
     const t = theme();
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];

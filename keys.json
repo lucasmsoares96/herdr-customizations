@@ -74,6 +74,7 @@
   },
   "layout:my-main": {
     "ctrl-tab": "my-tabs.agent-recent",
-    "ctrl-shift-tab": "my-tabs.agent-recent-back"
+    "ctrl-shift-tab": "my-tabs.agent-recent-back",
+    "cmd-shift-enter": "my-tabs.zoom"
   }
 }
