@@ -1,0 +1,24 @@
+# Only the personal customizations are tracked; everything else here is
+# written by Herdr (shipped mods, caches, window state, generated types).
+/*
+!/.gitignore
+!/README.md
+!/keys.json
+
+!/layouts/
+/layouts/*
+!/layouts/my-main.json
+
+!/mods/
+/mods/*
+!/mods/my-spaces/
+!/mods/my-tabs/
+!/mods/repository/
+!/mods/branches/
+!/mods/git-menu/
+!/mods/agent-switcher/
+
+# Rewritten by Herdr on every start.
+**/gpui-kit.d.ts
+**/jsconfig.json
+**/*.error
