@@ -17,6 +17,8 @@
 !/mods/branches/
 !/mods/git-menu/
 !/mods/agent-switcher/
+!/mods/my-changes/
+!/mods/diff-view/
 
 # Rewritten by Herdr on every start.
 **/gpui-kit.d.ts

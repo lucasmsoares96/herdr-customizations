@@ -7,7 +7,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, home } from "herdr";
+import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, home, checking, notify } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -71,6 +71,10 @@ export default class Spaces extends View {
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
     this.checked = {}; // where() -> when it was last looked at
     this.unsure = new Set(); // where()s git couldn't answer for (a machine away)
+    this.missing = new Set(); // where()s whose folder no longer exists (a removed worktree)
+    this.missingSince = {}; // where() -> when its folder was first found gone
+    this.wasTree = new Set(); // where()s seen as a linked worktree
+    this.closing = new Set(); // spaces being closed because their worktree is gone
     this.pending = new Set(); // where()s to look at next
     this.busy = {}; // pane -> an agent working or a program in front of its shell
     this.ready = {}; // machine -> its layout was readable at the last look
@@ -97,6 +101,8 @@ export default class Spaces extends View {
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
+    // A space whose worktree was removed (by an agent, by git) is closed.
+    if (!checking()) cx.timer.every(5000, (cx) => this.reap(cx));
   }
 
   checkNew(cx) {
@@ -248,11 +254,16 @@ export default class Spaces extends View {
         exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on }),
       );
       if (r.code !== 0 || common.code !== 0) {
-        // Only git's own "no" is remembered as no repo; anything else is asked again.
-        if (!/not a git repository/i.test(r.code !== 0 ? r.stderr : common.stderr)) {
+        // Only git's own "no", or a folder that is gone (a removed worktree), is remembered
+        // as no repo; anything else (a machine away) keeps what it showed and is asked again.
+        if (!/not a git repository|no such file or directory|cannot change to/i.test(r.code !== 0 ? r.stderr : common.stderr)) {
           this.unsure.add(key);
           this.git[key] ??= null;
-        } else this.git[key] = null;
+        } else {
+          this.git[key] = null;
+          const err = r.code !== 0 ? r.stderr : common.stderr;
+          if (/no such file or directory|cannot change to/i.test(err)) this.markMissing(key); else this.missing.delete(key);
+        }
         return;
       }
       // The repo's own .git folder names it; a worktree's top differs from it.
@@ -265,9 +276,15 @@ export default class Spaces extends View {
       const [ahead, behind] = counts.code === 0 ? counts.stdout.trim().split(/\s+/).map(Number) : [0, 0];
       const info = { name, branch: branch.code === 0 ? branch.stdout.trim().replace(/^refs\/heads\//, "") : "(detached)", ahead, behind, repo: JSON.stringify([on, repo]), linked: repo !== `${top}/.git`, top };
       this.git[key] = info;
+      this.missing.delete(key);
+      if (info.linked) this.wasTree.add(key);
       this.treesDue.add(info.repo);
       if (!on) this.watch(repo, cx);
     } catch {
+      // A folder that is gone (a removed worktree) can fail before git runs: no repo.
+      let gone = false;
+      try { gone = (await exec("test", ["-d", cwd], { on })).code !== 0; } catch {}
+      if (gone) { this.git[key] = null; this.markMissing(key); return; }
       // Couldn't ask (the machine is away): keep what it showed, look again later.
       this.git[key] ??= null;
       this.unsure.add(key);
@@ -292,6 +309,58 @@ export default class Spaces extends View {
       }
       this.trees[repoKey] = out;
     } catch {}
+  }
+
+  markMissing(key) {
+    this.missing.add(key);
+    this.missingSince[key] ??= Date.now();
+  }
+
+  // Close spaces left behind by a removed worktree: every terminal of the space is in a
+  // folder that is gone (seen twice, 5 s apart), and that folder was a worktree or sits
+  // inside a git repo. Anything else (a machine away, a folder outside git) stays.
+  reap(cx) {
+    if (this.reaping || !this.missing.size) return;
+    this.reaping = true;
+    cx.spawn(async () => {
+      try {
+        const ps = panes();
+        for (const s of spaces()) {
+          const k = where(s, ps);
+          if (!this.missing.has(k) || this.closing.has(s.id)) continue;
+          if (Date.now() - (this.missingSince[k] ?? Date.now()) < 5000) continue;
+          const [on, path] = JSON.parse(k);
+          if (!path) continue;
+          const tabs = new Set((s.tabs ?? []).map((t) => t.id));
+          const folders = [...new Set([path, ...ps.filter((p) => tabs.has(p.tab) && p.cwd).map((p) => p.cwd)])];
+          let allGone = true;
+          for (const f of folders) {
+            try { if ((await exec("test", ["-d", f], { on })).code === 0) { allGone = false; break; } }
+            catch { allGone = false; break; } // couldn't ask: leave it
+          }
+          if (!allGone) {
+            // The folder itself came back (or never left): it's no longer missing.
+            if (!(await this.stillGone(path, on))) { this.missing.delete(k); delete this.missingSince[k]; }
+            continue;
+          }
+          let inRepo = this.wasTree.has(k);
+          if (!inRepo) {
+            try {
+              const r = await exec("sh", ["-c", 'd=$1; while [ ! -d "$d" ]; do d=$(dirname "$d"); done; git -C "$d" rev-parse --show-toplevel', "sh", path], { on });
+              inRepo = r.code === 0;
+            } catch {}
+          }
+          if (!inRepo) continue;
+          this.closing.add(s.id);
+          run("space.close", { id: s.id, confirmed: true });
+          notify({ title: `Closed ${s.name}`, body: "Its worktree was removed.", level: "info", timeout: 5000 });
+        }
+      } finally { this.reaping = false; }
+    });
+  }
+
+  async stillGone(path, on) {
+    try { return (await exec("test", ["-d", path], { on })).code !== 0; } catch { return true; }
   }
 
   watch(repo, cx) {

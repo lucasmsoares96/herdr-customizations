@@ -7,6 +7,10 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input } from "gpui-base";
 import { spaces, panes, exec, theme, home, run, openOverlay, checking, shared, watchFolder } from "herdr";
 
+// A space whose folder was deleted (a removed worktree): a plain message, not exec's error.
+const GONE = "This space's folder was deleted";
+const friendly = (e) => { const m = String(e?.message ?? e); return /cannot run git: No such file or directory|cannot change to/i.test(m) ? GONE : m; };
+
 function location() {
   // Only the selected space, where it is now: its first terminal's live folder (the
   // same place the Spaces sidebar reads), else where it was made if it has no terminal.
@@ -128,7 +132,7 @@ export default class Branches extends View {
         this.repo = repo;
         this.error = null;
         this.watch(main, on, cx);
-      } catch (e) { if (this.gen === gen) this.error = String(e.message ?? e); }
+      } catch (e) { if (this.gen === gen) this.error = friendly(e); }
       finally { if (this.gen === gen) { this.syncing = false; cx.notify(); } }
     });
   }
@@ -223,7 +227,7 @@ export default class Branches extends View {
           .child(Input.new(this.input).h_full().w_full().text_size(12).text_color(t.foreground))))
       .child(div().flex_1().min_h(0).relative()
         .child(v_flex().id("branch-list").absolute().inset_0().overflow_y_scroll().px(6).pb(6).gap(1)
-          .when(!r, (el) => el.child(div().p(8).text_color(this.error && !/^(Not a git repository|No folder)$/.test(this.error) ? t.ansi1 : t.dim).child(this.error || "Loading…")))
+          .when(!r, (el) => el.child(div().p(8).text_color(this.error && !/^(Not a git repository|No folder|This space's folder was deleted)$/.test(this.error) ? t.ansi1 : t.dim).child(this.error || "Loading…")))
           .when(Boolean(r) && withTree.length > 0, (el) => el.child(head("IN A WORKTREE", withTree.length)).children(withTree.map((b) => this.row(b, t))))
           .when(Boolean(r) && rest.length > 0, (el) => el.child(head("OTHER BRANCHES", rest.length)).children(rest.map((b) => this.row(b, t))))
           .when(Boolean(r) && all.length === 0, (el) => el.child(div().p(8).text_color(t.dim).child(f ? "No branch matches" : "No branches"))))

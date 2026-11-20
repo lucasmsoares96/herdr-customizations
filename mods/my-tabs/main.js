@@ -121,10 +121,13 @@ export default class Tabs extends View {
     if (this.zoomed) { this.unfold(true); return; }
     const tab = spaces().find((s) => s.active)?.tabs?.find((x) => x.active);
     if (!tab) return;
+    // A tab already zoomed (from its pane header, or left that way) is undone, not folded further.
+    if (tab.zoomed) { run("pane.zoom", { pane: this.zoomedPane(tab.id) }); return; }
     const root = layout(), sidebar = find(root, "sidebar"), panel = find(root, "panel");
     const px = sidebar?.size?.px ?? 268;
-    const zoomPane = tab.panes > 1 && !tab.zoomed;
-    this.zoomed = { tab: tab.id, pane: zoomPane, seen: false, at: Date.now(),
+    const zoomPane = tab.panes > 1;
+    const focusedPane = panes().find((p) => p.tab === tab.id && p.focused)?.pane ?? null;
+    this.zoomed = { tab: tab.id, pane: zoomPane, paneId: focusedPane, seen: false, at: Date.now(),
       sidebar: !sidebar?.hidden && px >= 160 ? px : null, panel: Boolean(panel && !panel.hidden) };
     try { localStorage.setItem("zoom.saved", JSON.stringify(this.zoomed)); } catch {}
     if (zoomPane) run("pane.zoom");
@@ -134,6 +137,12 @@ export default class Tabs extends View {
       run("layout.resize", { id: "sidebar", px: window()?.platform === "macos" ? 76 : 44 });
     }
     if (this.zoomed.panel) run("layout.hide", { id: "panel" });
+  }
+
+  // The pane a tab is zoomed on (pane.zoom on it again unzooms it).
+  zoomedPane(tabId) {
+    const ps = panes().filter((p) => p.tab === tabId);
+    return (ps.find((p) => p.zoomed) ?? ps.find((p) => p.focused) ?? ps[0])?.pane ?? null;
   }
 
   // Back from focus mode: asked for (force), another tab shown, or the pane it zoomed
@@ -152,7 +161,11 @@ export default class Tabs extends View {
     }
     this.zoomed = null;
     try { localStorage.removeItem("zoom.saved"); } catch {}
-    if (force && z.pane && tab?.id === z.tab && tab.zoomed) run("pane.zoom");
+    // Unzoom the tab focus mode zoomed, wherever it is now (another tab or space may be shown).
+    if (z.pane) {
+      const zoomedTab = spaces().flatMap((s) => s.tabs ?? []).find((x) => x.id === z.tab);
+      if (zoomedTab?.zoomed) run("pane.zoom", { pane: this.zoomedPane(z.tab) ?? z.paneId });
+    }
     if (z.sidebar !== null && z.sidebar >= 160) {
       setShared("sidebar.collapsed", false);
       run("layout.resize", { id: "sidebar", px: z.sidebar });

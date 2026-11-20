@@ -5,8 +5,12 @@
 // $FORGEJO_TOKEN, else the one `fj auth login` saved. A token only goes to its forge.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, TextView } from "gpui-base";
-import { spaces, panes, exec, readTextFile, theme, home, run, openOverlay, checking, window } from "herdr";
+import { v_flex, h_flex, Scrollbar, TextView, InputState, Input, ScrollHandle } from "gpui-base";
+import { spaces, panes, exec, readTextFile, theme, home, run, openOverlay, checking, window, notify } from "herdr";
+
+// A space whose folder was deleted (a removed worktree): a plain message, not exec's error.
+const GONE = "This space's folder was deleted";
+const friendly = (e) => { const m = String(e?.message ?? e); return /cannot run git: No such file or directory|cannot change to/i.test(m) ? GONE : m; };
 
 const PAGE = 50;
 const MAX_PAGES = 40; // at most 2,000 per list
@@ -119,6 +123,11 @@ const ago = (iso) => {
   if (!(d >= 0)) return "";
   return d < 3600 ? `${Math.max(1, Math.round(d / 60))}m` : d < 86400 ? `${Math.round(d / 3600)}h` : d < 86400 * 60 ? `${Math.round(d / 86400)}d` : `${Math.round(d / 86400 / 30)}mo`;
 };
+// Time tracking: a clock for a running timer, a duration for tracked time.
+const pad = (n) => String(n).padStart(2, "0");
+const clock = (s) => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60; return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`; };
+const duration = (s) => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60); return h ? `${h}h ${pad(m)}m` : m ? `${m}m` : `${s}s`; };
+
 // A child issue opens with "Parte de #<parent>." (the repo's convention).
 const parentOf = (body) => Number(/^\s*Parte de #(\d+)/m.exec(body ?? "")?.[1]) || null;
 
@@ -168,10 +177,27 @@ export default class Repository extends View {
     this.remotes = stored("remotes", {}); // api -> the forge's branch names
     this.seen = stored("details", {}); // detail key -> when it was last read (the LRU order)
     this.actions = stored("actions", {}); // api -> recent workflow runs, newest first
+    // Issue timers, kept here until they are finished and sent to the forge as tracked time:
+    // `${api}#${n}` -> { key, api, host, forge, number, title, first, started, acc, error }.
+    this.timers = stored("timers", {});
+    this.sending = new Set();
+    // Search across the shown tab: open with the magnifier, Esc closes it.
+    this.query = "";
+    this.searching = false;
+    this.search = InputState.new({ placeholder: "Search" });
+    this.search.on("change", (_e, cx) => { this.query = this.search.value(); cx.notify(); });
+    this.search.on("submit", (_e, cx) => this.enterList(cx));
+    // Keyboard selection in the shown list: -1 is none; the list holds the keyboard while >= 0.
+    this.cursor = -1;
+    this.listHandle = cx.focus_handle();
+    this.detailHandle = cx.focus_handle();
+    this.listScroll = ScrollHandle.new();
     this.expanded = new Set(); // run ids whose jobs are shown
     this.jobsLoading = new Set(); // run ids whose jobs are being read
     this.workflow = null; // the Actions tab's workflow filter
     if (checking()) return;
+    // A running timer's clock (data, not animation): once a second, only while one runs.
+    cx.timer.every(1000, (cx) => { if (Object.values(this.timers).some((x) => x.started)) cx.notify(); });
     this.refresh(cx);
     cx.timer.every(POLL, (cx) => { if (!this.detail) this.refresh(cx, true); });
     // While a run is going, the Actions tab follows it more closely.
@@ -311,7 +337,17 @@ export default class Repository extends View {
     // again twice before it counts; an HTTP answer is never retried here.
     let res;
     for (let attempt = 1; ; attempt++) {
-      try { res = await fetch(`${r.api}${path}`, { headers: f.headers(r.token) }); break; }
+      try {
+        res = await fetch(`${r.api}${path}`, { headers: f.headers(r.token) });
+        // A renewed login (gh auth / fj auth) leaves the remembered token stale: read it again once.
+        if (res.status === 401 && attempt === 1) {
+          const k = `${r.forge ?? "forgejo"}|${r.host}`, old = r.token;
+          delete this.tokens[k];
+          r.token = await this.token(r.forge ?? "forgejo", r.host);
+          if (r.token && r.token !== old) continue;
+        }
+        break;
+      }
       catch (e) {
         if (attempt < 3) continue;
         const err = new Error(`Couldn't reach ${r.host}. Retrying…`);
@@ -420,7 +456,7 @@ export default class Repository extends View {
         publish(true);
       } catch (e) {
         if (current()) {
-          this.error = String(e.message ?? e);
+          this.error = friendly(e);
           if (!this.cached) { this.items = { issues: [], pulls: [] }; this.more = { issues: false, pulls: false }; }
           // Unreachable: look again soon instead of waiting for the next poll.
           if (e.network) cx.timer.after(10000, (cx) => { if (this.gen === gen) { this.refresh(cx, true); cx.notify(); } });
@@ -459,9 +495,13 @@ export default class Repository extends View {
         this.get(forgeOf(this.repo).blocks(n)).catch(() => []),
         isPull === true ? this.get(`/pulls/${n}`).catch(() => null) : Promise.resolve(undefined),
       ]);
+      const times = this.repo?.forge === "forgejo" ? await this.get(`/issues/${n}/times`).catch(() => null) : null;
       let pull = early;
       if (pull === undefined) pull = isPull !== false && item.pull_request ? await this.get(`/pulls/${n}`).catch(() => null) : null;
-      const d = { item: slim(item, true), pull: pull ? slim(pull) : null, comments: comments.map(slimComment), blockers: blockers.map(slimRef), blocks: blocks.map(slimRef) };
+      const spent = {};
+      for (const x of times ?? []) spent[x.user_name ?? "?"] = (spent[x.user_name ?? "?"] ?? 0) + (x.time ?? 0);
+      const d = { item: slim(item, true), pull: pull ? slim(pull) : null, comments: comments.map(slimComment), blockers: blockers.map(slimRef), blocks: blocks.map(slimRef),
+        spent: times ? Object.entries(spent).map(([user, seconds]) => ({ user, seconds })).sort((a, b) => b.seconds - a.seconds) : null };
       store(`detail:${k}`, d);
       this.seen[k] = Date.now();
       const order = Object.keys(this.seen).sort((a, b) => this.seen[b] - this.seen[a]);
@@ -554,7 +594,10 @@ export default class Repository extends View {
   back(cx) {
     const prev = this.trail.pop();
     if (prev) this.open(prev, cx, false);
-    else this.detail = null;
+    else {
+      this.detail = null;
+      if (this.cursor >= 0) cx.timer.after(30, () => this.listHandle.focus());
+    }
     cx.notify();
   }
 
@@ -597,24 +640,196 @@ export default class Repository extends View {
       .border_1().border_color(c + "88").bg(c + "26").text_color(t.foreground).child(label.name);
   }
 
-  shown() {
-    const all = this.items[this.kind] ?? [];
-    return this.label ? all.filter((i) => (i.labels ?? []).some((l) => l.name === this.label)) : all;
+  // Every word of the search must appear in one of the item's fields.
+  matches(...fields) {
+    const words = this.query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return true;
+    const text = fields.flat().filter((x) => x !== null && x !== undefined).join(" ").toLowerCase();
+    return words.every((w) => text.includes(w.replace(/^#(?=\d)/, "")));
   }
 
-  item(i, t, cx) {
+  shown() {
+    const all = this.items[this.kind] ?? [];
+    const labelled = this.label ? all.filter((i) => (i.labels ?? []).some((l) => l.name === this.label)) : all;
+    return labelled.filter((i) => this.matches(`#${i.number}`, String(i.number), i.title, (i.labels ?? []).map((l) => l.name),
+      i.user?.login, (i.assignees ?? []).map((a) => a.login), i.head?.ref, i.milestone?.title));
+  }
+
+  // What Enter does for each row of the shown list, in order.
+  visible() {
+    if (this.kind === "branches") return this.branchRows().map((b) => (cx) => this.workOn({ head: { ref: b.name } }, cx));
+    if (this.kind === "actions") return this.actionRows().map((run) => (cx) => this.toggleRun(run, cx));
+    return this.shown().map((i) => (cx) => { this.open(i.number, cx); cx.timer.after(30, () => this.detailHandle.focus()); });
+  }
+
+  // Enter or Down in the search: highlight the first row and give the list the keyboard.
+  enterList(cx) {
+    if (!this.visible().length) return;
+    this.cursor = 0;
+    this.listHandle.focus();
+    this.listScroll.scroll_to_item(0);
+    cx.notify();
+  }
+
+  moveCursor(dir) {
+    const n = this.visible().length;
+    if (!n) { this.cursor = -1; return; }
+    if (dir < 0 && this.cursor <= 0) { this.cursor = -1; if (this.searching) this.search.focus(); return; }
+    this.cursor = Math.min(Math.max(this.cursor + dir, 0), n - 1);
+    this.listScroll.scroll_to_item(this.cursor);
+  }
+
+  listBox(el) {
+    return el.track_focus(this.listHandle).track_scroll(this.listScroll).on_key_down((e, cx) => {
+      if (this.cursor < 0) return;
+      if (e.key === "down" || e.key === "up") this.moveCursor(e.key === "down" ? 1 : -1);
+      else if (e.key === "enter") { cx.stop_propagation(); this.visible()[this.cursor]?.(cx); cx.notify(); return; }
+      else if (e.key === "escape") { this.cursor = -1; if (this.searching) this.search.focus(); }
+      else return;
+      cx.stop_propagation();
+      cx.notify();
+    });
+  }
+
+  closeSearch(cx) {
+    this.searching = false; this.query = ""; this.search.set_value("");
+    cx.notify();
+  }
+
+  // ---- time tracking (Forgejo) ----
+
+  tracks() { return this.repo?.forge === "forgejo"; }
+  timerKey(n, api = this.repo?.api) { return `${api}#${n}`; }
+  elapsed(x) { return (x.acc ?? 0) + (x.started ? (Date.now() - x.started) / 1000 : 0); }
+  saveTimers() { store("timers", this.timers); }
+
+  // One timer runs at a time: starting another pauses the one running.
+  startTimer(i, cx) {
+    const r = this.repo;
+    if (!r) return;
+    const now = Date.now();
+    for (const x of Object.values(this.timers)) if (x.started) { x.acc = this.elapsed(x); x.started = null; }
+    const k = this.timerKey(i.number);
+    const x = this.timers[k] ?? { key: k, api: r.api, host: r.host, forge: r.forge ?? "forgejo", web: r.web, number: i.number, title: i.title, first: now, acc: 0 };
+    x.started = now; x.error = null; x.title = i.title ?? x.title;
+    this.timers[k] = x;
+    this.saveTimers();
+    cx.notify();
+  }
+
+  pauseTimer(k, cx) {
+    const x = this.timers[k];
+    if (!x?.started) return;
+    x.acc = this.elapsed(x); x.started = null;
+    this.saveTimers();
+    cx.notify();
+  }
+
+  discardTimer(k, cx) {
+    delete this.timers[k];
+    this.saveTimers();
+    cx.notify();
+  }
+
+  // Stop it and send its whole time to the issue as one tracked-time entry.
+  finishTimer(k, cx) {
+    const x = this.timers[k];
+    if (!x || this.sending.has(k)) return;
+    if (x.started) { x.acc = this.elapsed(x); x.started = null; }
+    const seconds = Math.round(x.acc);
+    this.saveTimers();
+    if (seconds < 1) { this.discardTimer(k, cx); return; }
+    this.sending.add(k);
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const send = async (token) => fetch(`${x.api}/issues/${x.number}/times`, {
+          method: "POST",
+          headers: { ...FORGES.forgejo.headers(token), "Content-Type": "application/json" },
+          body: JSON.stringify({ time: seconds, created: new Date(x.first).toISOString() }),
+        });
+        let token = await this.token(x.forge, x.host);
+        if (!token) throw new Error(`No Forgejo token for ${x.host}`);
+        let res = await send(token);
+        if (res.status === 401) {
+          delete this.tokens[`${x.forge}|${x.host}`];
+          const fresh = await this.token(x.forge, x.host);
+          if (fresh && fresh !== token) res = await send(fresh);
+        }
+        if (!res.ok) {
+          let why = "";
+          try { why = JSON.parse(await res.text())?.message ?? ""; } catch {}
+          throw new Error(`Forgejo answered ${res.status}${why ? `: ${why}` : ""}`);
+        }
+        delete this.timers[k];
+        this.saveTimers();
+        notify({ title: `${duration(seconds)} sent to #${x.number}`, body: x.title, level: "success", timeout: 4000 });
+        // The issue's tracked time on screen catches up.
+        if (this.detail?.number === x.number && this.repo?.api === x.api) this.open(x.number, cx, false);
+      } catch (e) {
+        if (this.timers[k]) { this.timers[k].error = String(e.message ?? e); this.saveTimers(); }
+      }
+      this.sending.delete(k);
+      cx.notify();
+    });
+  }
+
+  iconButton(id, icon, tip, color, t, action) {
+    return div().id(id).size(22).flex().flex_none().items_center().justify_center().rounded(5).cursor_pointer().text_color(color)
+      .hover((s) => s.bg(t.raised)).tooltip(tip)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => { cx.stop_propagation(); action(cx); })
+      .child(svg(icon.includes("/") ? icon : `mods/repository/${icon}.svg`).size(12));
+  }
+
+  // ▶ for an issue with no timer; clock with ⏸/▶ and ■ for one that has.
+  timerControls(i, t, idp) {
+    const k = this.timerKey(i.number), x = this.timers[k];
+    if (!x) return h_flex().flex_none().child(this.iconButton(`${idp}-start`, "play", "Start tracking time", t.dim, t, (cx) => this.startTimer(i, cx)));
+    const sending = this.sending.has(k);
+    return h_flex().flex_none().gap(1).items_center()
+      .child(div().flex_none().px(4).text_size(11).font_family("JetBrains Mono").text_color(x.error ? t.ansi1 : x.started ? t.accent : t.muted)
+        .tooltip(x.error ? `Not sent: ${x.error}` : x.started ? "Tracking" : "Paused").child(sending ? "sending…" : clock(this.elapsed(x))))
+      .child(x.started
+        ? this.iconButton(`${idp}-pause`, "pause", "Pause", t.accent, t, (cx) => this.pauseTimer(k, cx))
+        : this.iconButton(`${idp}-resume`, "play", "Resume", t.muted, t, (cx) => this.startTimer(i, cx)))
+      .child(this.iconButton(`${idp}-stop`, "stop", "Stop and send the time to Forgejo", t.ansi1, t, (cx) => this.finishTimer(k, cx)));
+  }
+
+  // Every timer, from any repo, so one left running elsewhere is never forgotten.
+  timerStrip(t) {
+    const list = Object.values(this.timers).sort((a, b) => Number(Boolean(b.started)) - Number(Boolean(a.started)) || b.first - a.first);
+    if (!list.length) return null;
+    return v_flex().flex_none().px(8).py(4).gap(1).border_b(1).border_color(t.border).bg(t.chrome)
+      .children(list.map((x) => {
+        const here = this.repo?.api === x.api;
+        const repoName = x.api.split("/repos/")[1] ?? "";
+        return h_flex().id(`tm-${x.key}`).h(26).px(4).gap(6).items_center().rounded(5)
+          .when(here, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.open(x.number, cx)))
+          .child(div().size(6).flex_none().rounded(3).bg(x.error ? t.ansi1 : x.started ? t.accent : t.dim))
+          .child(div().flex_none().text_size(11).text_color(t.dim).child(`#${x.number}`))
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).child(x.title ?? ""))
+          .when(!here, (el) => el.child(div().flex_none().max_w(110).truncate().text_size(10.5).text_color(t.dim).child(repoName)))
+          .child(this.timerControls({ number: x.number, title: x.title }, t, `strip-${x.number}`))
+          .when(!x.started, (el) => el.child(this.iconButton(`tm-x-${x.number}-${repoName}`, "mods/workspace-chrome/x.svg", "Discard without sending", t.dim, t, (cx) => this.discardTimer(x.key, cx))));
+      }));
+  }
+
+  item(i, t, cx, n = -1) {
     const pr = this.kind === "pulls";
     const ref = pr ? i.head?.ref : null;
     const tree = ref ? this.branches[ref] : null;
     const space = tree ? this.spaceAt(tree) : null;
     const who = (i.assignees ?? []).map((a) => a.login).join(", ") || i.user?.login || "";
     return v_flex().id(`item-${i.number}`).flex_none().px(8).py(6).gap(4).rounded(7).cursor_pointer()
+      .when(n === this.cursor, (el) => el.bg(t.selected))
       .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.open(i.number, cx))
       .on_hover((hovered, cx) => { if (hovered) this.warm(i, pr, cx); })
       .child(h_flex().gap(6).items_start()
         .child(div().flex_none().text_color(t.dim).child(`#${i.number}`))
         .child(div().flex_1().min_w(0).child(i.title))
-        .when(pr && i.draft, (el) => el.child(div().flex_none().text_size(10).text_color(t.dim).child("draft"))))
+        .when(pr && i.draft, (el) => el.child(div().flex_none().text_size(10).text_color(t.dim).child("draft")))
+        .when(!pr && this.tracks(), (el) => el.child(this.timerControls(i, t, `row-${i.number}`))))
       .child(h_flex().gap(4).items_center().flex_wrap().text_size(10.5).text_color(t.dim)
         .children((i.labels ?? []).map((l) => this.chip(l, t)))
         .when(Boolean(ref), (el) => el.child(h_flex().gap(3).items_center().min_w(0)
@@ -654,11 +869,13 @@ export default class Repository extends View {
     const sameRepo = pull && pull.head?.repo?.full_name === pull.base?.repo?.full_name;
     const tree = ref ? this.branches[ref] : null;
     const space = tree ? this.spaceAt(tree) : null;
-    return v_flex().flex_1().min_h(0)
+    return v_flex().flex_1().min_h(0).track_focus(this.detailHandle)
+      .on_key_down((e, cx) => { if (e.key === "escape") { cx.stop_propagation(); this.back(cx); } })
       .child(h_flex().h(36).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().id("back").px(6).h(24).flex().items_center().rounded(5).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((_e, cx) => this.back(cx)).child("← Back"))
         .child(div().flex_1())
+        .when(Boolean(i) && !pull && this.tracks() && !i.pull_request, (el) => el.child(this.timerControls(i, t, `detail-${i.number}`)))
         .when(Boolean(i), (el) => el
           .child(this.button("copy", "Copy #", t, (_e, cx) => cx.write_to_clipboard(`#${i.number}`)))
           .child(this.button("browser", "Open in browser", t, () => this.browse(i.html_url)))))
@@ -677,6 +894,9 @@ export default class Repository extends View {
               .when((i.assignees ?? []).length > 0, (el) => el.child(div().child(`→ ${(i.assignees ?? []).map((a) => a.login).join(", ")}`)))
               .when(Boolean(i.milestone), (el) => el.child(div().child(`◇ ${i.milestone.title}`))))
             .when((i.labels ?? []).length > 0, (el) => el.child(h_flex().pt(6).gap(4).flex_wrap().children(i.labels.map((l) => this.chip(l, t)))))
+            .when(Boolean(d.spent?.length), (el) => el.child(h_flex().pt(6).gap(6).items_center().flex_wrap().text_size(11).text_color(t.dim)
+              .child(div().flex_none().child(`Spent ${duration(d.spent.reduce((n, x) => n + x.seconds, 0))}`))
+              .when(d.spent.length > 1 || d.spent[0].user, (el) => el.children(d.spent.map((x) => div().flex_none().text_color(t.muted).child(`${x.user} ${duration(x.seconds)}`))))))
             .when(Boolean(pull), (el) => el.child(v_flex().mt(10).p(8).gap(6).rounded(7).border_1().border_color(t.border)
               .child(h_flex().gap(6).items_center().text_size(11.5)
                 .child(svg("mods/workspace-chrome/git-branch.svg").size(12).flex_none().text_color(t.dim))
@@ -763,12 +983,17 @@ export default class Repository extends View {
     return div().w(size).flex_none().text_size(size).text_color(color).child(glyph);
   }
 
-  actionsView(t) {
+  actionRows() {
     const r = this.repo, runs = (r && this.actions[r.api]) || [];
-    const shown = this.workflow ? runs.filter((x) => x.workflow === this.workflow) : runs;
+    return (this.workflow ? runs.filter((x) => x.workflow === this.workflow) : runs)
+      .filter((x) => this.matches(x.title, x.workflow, x.branch, x.event, `#${x.number}`, String(x.number), (x.jobs ?? []).map((j) => j.name)));
+  }
+
+  actionsView(t) {
+    const r = this.repo, shown = this.actionRows();
     const prs = (r && this.lists[`${r.api}|open`]?.pulls) || [];
-    return v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1)
-      .children(shown.map((run) => {
+    return this.listBox(v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1))
+      .children(shown.map((run, n) => {
         const state = runState(run), open = this.expanded.has(run.id);
         // Forgejo names a PR run's branch "#518"; GitHub gives the branch, matched to an open PR.
         const prNumber = /^#(\d+)$/.exec(run.branch ?? "")?.[1] ?? prs.find((p) => p.head?.ref === run.branch)?.number;
@@ -776,7 +1001,7 @@ export default class Repository extends View {
         const branch = pr && /^#/.test(run.branch ?? "") ? prs.find((p) => p.number === pr)?.head?.ref ?? null : run.branch;
         const tree = branch ? this.branches[branch] : null;
         const space = tree ? this.spaceAt(tree) : null;
-        return v_flex().id(`run-${run.id}`).flex_none().rounded(7)
+        return v_flex().id(`run-${run.id}`).flex_none().rounded(7).when(n === this.cursor, (el) => el.bg(t.selected))
           .child(v_flex().id(`run-head-${run.id}`).px(8).py(6).gap(3).rounded(7).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => this.toggleRun(run, cx))
             .child(h_flex().gap(7).items_center()
@@ -805,20 +1030,26 @@ export default class Repository extends View {
               .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(j.name))))));
       }))
       .when(!shown.length, (el) => el.child(div().p(8).text_color(this.actionsError ? t.ansi1 : t.dim)
-        .child(this.actionsError || (this.syncing ? "Loading…" : "No workflow runs"))));
+        .child(this.actionsError || (this.query.trim() ? "Nothing matches the search" : this.syncing ? "Loading…" : "No workflow runs"))));
   }
 
   // The forge's branches: each with its open PR and, when checked out here, its worktree's space.
-  remoteView(t) {
+  branchRows() {
     const r = this.repo, names = (r && this.remotes[r.api]) || [];
     const prs = ((r && this.lists[`${r.api}|open`]?.pulls) || []);
     const prOf = (name) => prs.find((p) => p.head?.ref === name);
-    const rows = names.map((name) => ({ name, pr: prOf(name), tree: this.branches[name] }))
+    return names.map((name) => ({ name, pr: prOf(name), tree: this.branches[name] }))
+      .filter(({ name, pr, tree }) => this.matches(name, pr ? [`#${pr.number}`, pr.title] : null, tree ? this.spaceAt(tree)?.name : null))
       .sort((a, b) => Number(Boolean(b.pr)) - Number(Boolean(a.pr)) || a.name.localeCompare(b.name));
-    return v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1)
-      .children(rows.map(({ name, pr, tree }) => {
+  }
+
+  remoteView(t) {
+    const rows = this.branchRows();
+    return this.listBox(v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1))
+      .children(rows.map(({ name, pr, tree }, n) => {
         const space = tree ? this.spaceAt(tree) : null;
         return h_flex().id(`rb-${name}`).flex_none().h(30).px(8).gap(6).items_center().rounded(7).cursor_pointer()
+          .when(n === this.cursor, (el) => el.bg(t.selected))
           .hover((s) => s.bg(t.hover))
           .tooltip(pr ? `#${pr.number} ${pr.title}` : space ? `Go to ${space.name}` : tree ? "Open a space at its worktree" : "Make a worktree for it")
           .on_click((_e, cx) => this.workOn({ head: { ref: name } }, cx))
@@ -829,7 +1060,7 @@ export default class Repository extends View {
             .bg(t.raised).text_color(t.foreground).hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); this.open(pr.number, cx); }).child(`#${pr.number}`)));
       }))
-      .when(!rows.length, (el) => el.child(div().p(8).text_color(t.dim).child(this.syncing ? "Loading…" : "No branches")));
+      .when(!rows.length, (el) => el.child(div().p(8).text_color(t.dim).child(this.query.trim() ? "Nothing matches the search" : this.syncing ? "Loading…" : "No branches")));
   }
 
   listView(t, cx) {
@@ -865,7 +1096,31 @@ export default class Repository extends View {
         .child(tab("branches", "Branches", ((this.repo && this.remotes[this.repo.api]) || []).length))
         .child(tab("actions", "Actions", null, (el) => el.when(running > 0, (el) => el
           .child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(t.working).spin(900))
-          .child(div().text_size(10.5).text_color(t.dim).child(String(running)))))))
+          .child(div().text_size(10.5).text_color(t.dim).child(String(running))))))
+        .child(div().flex_1())
+        .child(div().id("search-toggle").size(26).flex().flex_none().items_center().justify_center().rounded(6).cursor_pointer()
+          .bg(this.searching ? t.selected : t.background).text_color(this.searching || this.query ? t.foreground : t.dim)
+          .hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Search")
+          .on_click((_e, cx) => {
+            if (this.searching) return this.closeSearch(cx);
+            this.searching = true;
+            cx.timer.after(30, () => this.search.focus());
+            cx.notify();
+          })
+          .child(svg("mods/workspace-chrome/search.svg").size(14))))
+      .when(this.searching, (el) => el.child(h_flex().flex_none().px(8).py(6).gap(6).items_center().border_b(1).border_color(t.border)
+        .on_key_down((e, cx) => {
+          if (e.key === "escape") { cx.stop_propagation(); this.closeSearch(cx); }
+          else if (e.key === "down") { cx.stop_propagation(); this.enterList(cx); }
+        })
+        .child(h_flex().id("search-box").flex_1().min_w(0).h(28).px(8).gap(6).items_center().rounded(6).border_1().border_color(t.accent).bg(t.background)
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .child(svg("mods/workspace-chrome/search.svg").size(12).flex_none().text_color(t.dim))
+          .child(Input.new(this.search).flex_1().h_full().text_size(12).text_color(t.foreground)))
+        .child(div().id("search-close").size(22).flex().flex_none().items_center().justify_center().rounded(5).cursor_pointer().text_color(t.dim)
+          .hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip("Close search (Esc)")
+          .on_click((_e, cx) => this.closeSearch(cx))
+          .child(svg("mods/workspace-chrome/x.svg").size(12)))))
       .when(!other, (el) => el.child(h_flex().flex_none().px(8).py(6).gap(4).flex_wrap().items_center().border_b(1).border_color(t.border)
         .child(h_flex().h(20).flex_none().rounded(5).overflow_hidden().border_1().border_color(t.border)
           .child(segment("open")).child(div().w(1).h_full().bg(t.border)).child(segment("closed")))
@@ -886,10 +1141,10 @@ export default class Repository extends View {
       .child(div().flex_1().min_h(0).relative()
         .when(this.kind === "branches", (el) => el.child(this.remoteView(t)))
         .when(this.kind === "actions", (el) => el.child(this.actionsView(t)))
-        .when(!other, (el) => el.child(v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1)
-          .children(shown.map((i) => this.item(i, t, cx)))
-          .when(!shown.length, (el) => el.child(div().p(8).text_color(this.error && !/^(Not a git repository|No folder)$/.test(this.error) ? t.ansi1 : t.dim)
-            .child(this.error || (this.loading ? "Loading…" : this.label ? `Nothing labelled ${this.label} here` : `No ${this.state} ${this.kind === "pulls" ? "pull requests" : "issues"}`))))
+        .when(!other, (el) => el.child(this.listBox(v_flex().id("repository-list").absolute().inset_0().overflow_y_scroll().p(6).gap(1))
+          .children(shown.map((i, n) => this.item(i, t, cx, n)))
+          .when(!shown.length, (el) => el.child(div().p(8).text_color(this.error && !/^(Not a git repository|No folder|This space's folder was deleted)$/.test(this.error) ? t.ansi1 : t.dim)
+            .child(this.error || (this.loading ? "Loading…" : this.query.trim() ? "Nothing matches the search" : this.label ? `Nothing labelled ${this.label} here` : `No ${this.state} ${this.kind === "pulls" ? "pull requests" : "issues"}`))))
           .when(this.more[this.kind] && this.syncing && shown.length > 0, (el) => el.child(h_flex().mt(4).h(28).gap(6).items_center().justify_center()
             .text_size(11.5).text_color(t.dim)
             .child(svg("mods/workspace-chrome/spinner.svg").size(11).spin(900)).child("Loading the rest…")))))
@@ -898,6 +1153,8 @@ export default class Repository extends View {
 
   render(cx) {
     if (!checking() && key() !== this.context) this.refresh(cx);
+    const listKey = [this.kind, this.state, this.label, this.workflow, this.query, this.repo?.api].join("|");
+    if (listKey !== this.listKey) { this.listKey = listKey; this.cursor = -1; }
     const t = theme(), r = this.repo;
     return v_flex().id("repository").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
       .text_color(t.foreground).text_size(12.5)
@@ -912,6 +1169,7 @@ export default class Repository extends View {
           .on_click((_e, cx) => { this.tokens = {}; this.forges = {}; if (this.repo) this.repo.token = null; if (this.detail) this.open(this.detail.number, cx, false); this.refresh(cx); cx.notify(); })
           .tooltip(this.syncing || this.detail?.loading ? "Updating from Forgejo…" : "Reload")
           .child(this.syncing || this.detail?.loading ? svg("mods/workspace-chrome/spinner.svg").size(12).spin(900) : "↻")))
+      .when(Object.keys(this.timers).length > 0, (el) => el.child(this.timerStrip(t)))
       .child(this.detail ? this.detailView(t, cx) : this.listView(t, cx));
   }
 }
