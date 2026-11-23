@@ -555,16 +555,27 @@ export default class Repository extends View {
   }
 
   // The space whose first terminal is in this checkout (or below it).
+  // Where each space is now, read once per frame: panes() copies every pane on each call,
+  // and list rows ask this for every branch, PR and run.
+  places() {
+    const f = this.frame;
+    if (f && Date.now() - f.at < 250) return f.list;
+    const ps = panes(), firstCwd = {};
+    for (const p of ps) if (p.cwd && !(p.tab in firstCwd)) firstCwd[p.tab] = p.cwd;
+    const list = spaces().map((s) => ({ s, at: (s.tabs ?? []).map((t) => firstCwd[t.id]).find(Boolean) || s.folder }));
+    this.frame = { at: Date.now(), list, memo: new Map() };
+    return list;
+  }
+
   spaceAt(path) {
-    const ps = panes();
+    const list = this.places(), memo = this.frame.memo;
+    if (memo.has(path)) return memo.get(path);
     const inside = (p) => p === path || p?.startsWith(path + "/");
     const nested = Object.values(this.branches).filter((p) => p !== path && p.startsWith(path + "/"));
-    return spaces().find((s) => {
-      if ((s.machine ?? null) !== (this.repo?.on ?? null)) return false;
-      const tabs = new Set((s.tabs ?? []).map((t) => t.id));
-      const at = ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
-      return inside(at) && !nested.some((n) => at === n || at.startsWith(n + "/"));
-    });
+    const found = list.find(({ s, at }) => (s.machine ?? null) === (this.repo?.on ?? null)
+      && inside(at) && !nested.some((n) => at === n || at.startsWith(n + "/")))?.s ?? null;
+    memo.set(path, found);
+    return found;
   }
 
   open(number, cx, back = true) {
@@ -1152,6 +1163,7 @@ export default class Repository extends View {
   }
 
   render(cx) {
+    this.frame = null; // fresh spaces and panes for this frame
     if (!checking() && key() !== this.context) this.refresh(cx);
     const listKey = [this.kind, this.state, this.label, this.workflow, this.query, this.repo?.api].join("|");
     if (listKey !== this.listKey) { this.listKey = listKey; this.cursor = -1; }

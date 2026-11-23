@@ -151,15 +151,20 @@ export default class Branches extends View {
     });
   }
 
+  // Where each space is now, read once per frame (panes() copies every pane on each call).
+  places() {
+    if (this.frame) return this.frame;
+    const firstCwd = {};
+    for (const p of panes()) if (p.cwd && !(p.tab in firstCwd)) firstCwd[p.tab] = p.cwd;
+    this.frame = spaces().map((s) => ({ s, at: (s.tabs ?? []).map((t) => firstCwd[t.id]).find(Boolean) || s.folder }));
+    return this.frame;
+  }
+
   spaceAt(path) {
-    const ps = panes(), trees = (this.repo?.branches ?? []).map((b) => b.tree).filter(Boolean);
+    const trees = (this.repo?.branches ?? []).map((b) => b.tree).filter(Boolean);
     const nested = trees.filter((p) => p !== path && inside(p, path));
-    return spaces().find((s) => {
-      if ((s.machine ?? null) !== (this.repo?.on ?? null)) return false;
-      const tabs = new Set((s.tabs ?? []).map((t) => t.id));
-      const at = ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
-      return inside(at, path) && !nested.some((n) => inside(at, n));
-    });
+    return this.places().find(({ s, at }) => (s.machine ?? null) === (this.repo?.on ?? null)
+      && inside(at, path) && !nested.some((n) => inside(at, n)))?.s;
   }
 
   go(b) {
@@ -203,6 +208,7 @@ export default class Branches extends View {
   }
 
   render(cx) {
+    this.frame = null; // fresh spaces and panes for this frame
     if (!checking() && (key() !== this.context || shared("git.changed") !== this.changed)) this.refresh(cx);
     const t = theme(), r = this.repo;
     const f = this.filter.trim().toLowerCase();
