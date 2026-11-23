@@ -1,6 +1,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
 import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings, agents, nextCommand, checking } from "herdr";
+import { AgentResume } from "./resume.js";
 
 // Ctrl+Tab opens agent-switcher (Firefox-style, across every space). This copy keeps
 // the most-recently-focused order: the agent you land on goes on top, the one you
@@ -34,6 +35,12 @@ function label(tab, lead) {
 
 export default class Tabs extends View {
   init(_props, cx) {
+    // Agents lost with their terminals (a reboot) come back with `claude --resume`.
+    if (!checking()) {
+      this.resume = new AgentResume();
+      cx.timer.after(3000, (cx) => cx.spawn(async () => this.resume.tick()));
+      cx.timer.every(15000, (cx) => cx.spawn(async () => this.resume.tick()));
+    }
     try { this.zoomed = JSON.parse(localStorage.getItem("zoom.saved") ?? "null"); } catch { this.zoomed = null; }
     if (this.zoomed) this.zoomed.seen = true;
     try { this.recent = JSON.parse(localStorage.getItem("agents.recent") ?? "[]"); } catch { this.recent = []; }
