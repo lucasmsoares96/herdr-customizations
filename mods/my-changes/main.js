@@ -210,7 +210,6 @@ export default class MyChanges extends View {
     const color = f.status === "A" ? t.ansi2 : f.status === "D" || f.status === "U" ? t.ansi1 : t.blocked;
     return h_flex().id(`cf-${f.path}`).h(FILE_ROW - 1).flex_none().mx(4).px(8).gap(8).items_center().rounded(6).cursor_pointer()
       .when(on, (e) => e.bg(t.selected)).hover((s) => s.bg(on ? t.selected : t.hover))
-      .on_click(() => this.pickFile(f))
       .child(div().w(12).flex_none().text_size(11).text_color(color).child(f.status))
       .child(h_flex().flex_1().min_w(0).gap(6)
         .child(div().flex_none().max_w(200).truncate().text_color(f.status === "D" ? t.dim : t.foreground).child(name))
@@ -223,7 +222,6 @@ export default class MyChanges extends View {
     const on = this.sel?.sha === c.sha;
     return v_flex().id(`cm-${c.sha}`).h(COMMIT_ROW - 2).flex_none().mx(4).px(8).gap(2).justify_center().rounded(6).cursor_pointer()
       .when(on, (e) => e.bg(t.selected)).hover((s) => s.bg(on ? t.selected : t.hover))
-      .on_click((_e, cx) => this.pickCommit(c, cx))
       .child(h_flex().gap(6).items_center()
         .child(div().size(7).flex_none().rounded(4).border_1().border_color(c.unpushed ? t.accent : t.dim).when(c.unpushed, (e) => e.bg(t.accent)))
         .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(c.subject)))
@@ -271,7 +269,10 @@ export default class MyChanges extends View {
       .child(div().flex_1().min_h(60).relative()
         .when(files.length > 0, (el) => el
           .child(div().absolute().inset_0().pt(4).child(v_virtual_list("cf-list", files.length, FILE_ROW, (i) => files[i].path,
-            (range) => files.slice(range.start, range.end).map((f) => this.fileRow(f, t))).size_full()))
+            (range) => files.slice(range.start, range.end).map((f) => this.fileRow(f, t)))
+            // Rows of a virtual list can't hold handlers: one for the list, by key.
+            .on_item_click((path) => { const f = files.find((x) => x.path === path); if (f) this.pickFile(f); })
+            .size_full()))
           .child(Scrollbar.vertical("cf-list").viewport_from_layout().absolute().inset_0()))
         .when(!files.length, (e) => e.child(div().p(12).text_color(this.error && !/^(Not a git repository|No folder|This space's folder was deleted)$/.test(this.error) ? t.ansi1 : t.dim).child(empty))))
       .when(this.limited && !this.sel, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files")))
@@ -290,7 +291,9 @@ export default class MyChanges extends View {
           (el) => el.when(Boolean(this.upstream), (el) => el.child(div().flex_none().font_normal().max_w(160).truncate().child(`vs ${this.upstream}`)))))
         .child(div().flex_1().min_h(60).relative()
           .child(div().absolute().inset_0().pt(4).child(v_virtual_list("cm-list", this.commits.length, COMMIT_ROW, (i) => this.commits[i].sha,
-            (range) => this.commits.slice(range.start, range.end).map((c) => this.commitRow(c, t))).size_full()))
+            (range) => this.commits.slice(range.start, range.end).map((c) => this.commitRow(c, t)))
+            .on_item_click((sha, cx) => { const c = this.commits.find((x) => x.sha === sha); if (c) this.pickCommit(c, cx); })
+            .size_full()))
           .child(Scrollbar.vertical("cm-list").viewport_from_layout().absolute().inset_0())));
   }
 }

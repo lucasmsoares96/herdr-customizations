@@ -39,7 +39,7 @@ export default class Tabs extends View {
     if (!checking()) {
       this.resume = new AgentResume();
       cx.timer.after(3000, (cx) => cx.spawn(async () => this.resume.tick()));
-      cx.timer.every(3000, (cx) => cx.spawn(async () => this.resume.tick()));
+      cx.timer.every(10000, (cx) => cx.spawn(async () => this.resume.tick()));
     }
     try { this.zoomed = JSON.parse(localStorage.getItem("zoom.saved") ?? "null"); } catch { this.zoomed = null; }
     if (this.zoomed) this.zoomed.seen = true;
